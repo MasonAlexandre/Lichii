@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -61,6 +63,79 @@ void OnBack(const Func& func) {
 
 void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
+}
+
+// A semaphore release for the back: a query cache report at `address` (EDEN_NX2_DMA_READ_TRACK
+// notes its words instead of a write of unknown range).
+template <typename Func>
+void ReleaseOnBack(GPUVAddr address, const Func& func) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        func();
+        return;
+    }
+    if (split.DmaReadTrack() == 0) {
+        split.Defer(func);
+        return;
+    }
+    split.Defer(func, VideoCommon::GpuSplit::NoGuestWrite);
+    split.NoteGuestWrite(address, 16);
+    split.NoteQueryTarget(address);
+}
+
+// EDEN_NX2_DMA_READ_TRACK: the semaphore word without draining the back, when every write sent
+// before the acquire that can reach it has run (as FrontDmaRead does for macro reads).
+std::optional<u32> TrackedSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active() || split.DmaReadTrack() == 0) {
+        return std::nullopt;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2MayBeGpuWritten(*device, sizeof(u32))) {
+        return std::nullopt;
+    }
+    u64 target = 0;
+    bool query_page = false;
+    if (split.GuestReadNeeds(address, sizeof(u32), target, query_page) ==
+        VideoCommon::GpuSplit::ReadNeed::Wait) {
+        split.WaitForPosition(target, VideoCommon::DrainSite::Acquire);
+    }
+    if (query_page && dma_pusher.rasterizer->HasRegisteredQueries(*device, sizeof(u32))) {
+        return std::nullopt;
+    }
+    return dma_pusher.memory_manager.Read<u32>(address);
+}
+
+struct AcquireStats {
+    u64 checks{};
+    u64 met_early{};
+    u64 misses{};
+    std::chrono::steady_clock::time_point since{};
+};
+
+void CountAcquire(AcquireStats& stats, bool met_early, bool missed) {
+    ++stats.checks;
+    stats.met_early += met_early ? 1 : 0;
+    stats.misses += missed ? 1 : 0;
+    if ((stats.checks & 0xff) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (stats.since.time_since_epoch().count() == 0) {
+        stats.since = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - stats.since).count();
+    if (seconds < 2.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Acquire track (mode {}) {:.1f}s: acquires {} | met without a drain {} | verify "
+             "misses {}",
+             VideoCommon::GpuSplit::Get().DmaReadTrack(), seconds, stats.checks, stats.met_early,
+             stats.misses);
+    stats = {};
+    stats.since = now;
 }
 
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
@@ -252,7 +327,8 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
-        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
+        ReleaseOnBack(sequence_address, [rasterizer = dma_pusher.rasterizer, sequence_address,
+                                         properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
     } else if (g_nx2_ampere) {
@@ -273,8 +349,21 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // EDEN_NX2_DMA_READ_TRACK: a value already met needs no drain (mode 2 verifies it).
+        const auto tracked = TrackedSemaphoreWord(dma_pusher, acquire.address);
+        const bool met_early = tracked && acquire.Matches(*tracked);
+        const u32 track = VideoCommon::GpuSplit::Get().DmaReadTrack();
+        static AcquireStats acquire_stats;
+        if (met_early && track == 1) {
+            CountAcquire(acquire_stats, true, false);
+            return;
+        }
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        const bool met = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
+        if (track != 0) {
+            CountAcquire(acquire_stats, met_early, met_early && !met);
+        }
+        if (met) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -326,7 +415,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
-    OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+    ReleaseOnBack(sequence_address, [rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
@@ -357,7 +446,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
-        OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
+        ReleaseOnBack(address, [rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });

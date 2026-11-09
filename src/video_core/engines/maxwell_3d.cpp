@@ -1605,49 +1605,58 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     const u32 track = split.DmaReadTrack();
     ReadNeed need = ReadNeed::Full;
     u64 target = 0;
+    bool query_page = false;
     if (track != 0) {
-        need = FrontDmaReadNeed(split, source, read_bytes, target);
+        need = FrontDmaReadNeed(split, source, read_bytes, target, query_page);
     }
-    std::vector<u32> fast_words;
-    if (track == 2 && need != ReadNeed::Full) {
-        // Verify: what the tracked read would see, then the drained read to compare it with.
+    if (need != ReadNeed::Full) {
         if (need == ReadNeed::Wait) {
             split.WaitForPosition(target, VideoCommon::DrainSite::MacroDmaRead);
         }
+        // Every release sent before the read has run: a result not in memory yet is still
+        // registered in the query cache.
+        if (query_page) {
+            if (FrontQueryResultsPending(source, read_bytes)) {
+                need = ReadNeed::Full;
+                dma_read_stats.full_query++;
+            } else {
+                dma_read_stats.query_written++;
+            }
+        }
+    }
+    std::vector<u32> fast_words;
+    if (track == 2 && need != ReadNeed::Full) {
+        // Verify: what the tracked read sees, then the drained read to compare it with.
         fast_words.resize(words);
         memory_manager.ReadBlockUnsafe(source, fast_words.data(), read_bytes);
     }
     const bool fast = track == 1 && need != ReadNeed::Full;
-    if (fast) {
-        if (need == ReadNeed::Wait) {
-            split.WaitForPosition(target, VideoCommon::DrainSite::MacroDmaRead);
+    if (!fast) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+        if (VideoCommon::QueryDma::TraceEnabled()) {
+            split.Run(
+                [this, macro, method, source, read_bytes] {
+                    if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
+                                                                 read_bytes)) {
+                        VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro, method,
+                                                     source, read_bytes);
+                    }
+                },
+                VideoCommon::DrainSite::MacroDmaFlush);
         }
-    } else {
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
-    if (VideoCommon::QueryDma::TraceEnabled()) {
+        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+            split.Run(
+                [memory = &memory_manager, source, read_bytes] {
+                    memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+                },
+                VideoCommon::DrainSite::MacroDmaFlush);
+        }
+        // Write out the reports held in the query cache, or the read returns stale occlusion counts.
         split.Run(
-            [this, macro, method, source, read_bytes] {
-                if (VideoCommon::QueryDma::HasPendingQueries(memory_manager, *rasterizer, source,
-                                                             read_bytes)) {
-                    VideoCommon::QueryDma::Trace(memory_manager, *rasterizer, macro, method,
-                                                 source, read_bytes);
-                }
+            [this, source, read_bytes] {
+                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
             },
             VideoCommon::DrainSite::MacroDmaFlush);
-    }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        split.Run(
-            [memory = &memory_manager, source, read_bytes] {
-                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
-            },
-            VideoCommon::DrainSite::MacroDmaFlush);
-    }
-    // Write out the reports held in the query cache, or the read returns stale occlusion counts.
-    split.Run(
-        [this, source, read_bytes] {
-            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
-        },
-        VideoCommon::DrainSite::MacroDmaFlush);
     }
     u32 changed{};
     u32 track_changed{};
@@ -1678,9 +1687,22 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
 }
 
+bool Maxwell3D::FrontQueryResultsPending(GPUVAddr source, size_t size) {
+    const GPUVAddr end = source + size;
+    for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        const GPUVAddr begin = std::max(source, page);
+        const GPUVAddr page_end = std::min(end, page + 0x1000);
+        if (!device || rasterizer->HasRegisteredQueries(*device + (begin - page), page_end - begin)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 VideoCommon::GpuSplit::ReadNeed Maxwell3D::FrontDmaReadNeed(VideoCommon::GpuSplit& split,
                                                            GPUVAddr source, size_t size,
-                                                           u64& target) {
+                                                           u64& target, bool& query_page) {
     using ReadNeed = VideoCommon::GpuSplit::ReadNeed;
     if (size == 0) {
         return ReadNeed::None;
@@ -1701,11 +1723,7 @@ VideoCommon::GpuSplit::ReadNeed Maxwell3D::FrontDmaReadNeed(VideoCommon::GpuSpli
             return ReadNeed::Full;
         }
     }
-    const ReadNeed need = split.GuestReadNeeds(source, size, target);
-    if (need == ReadNeed::Full) {
-        dma_read_stats.full_query++;
-    }
-    return need;
+    return split.GuestReadNeeds(source, size, target, query_page);
 }
 
 void Maxwell3D::FrontDmaReadStats(u32 track, VideoCommon::GpuSplit::ReadNeed need, bool missed) {
@@ -1733,10 +1751,10 @@ void Maxwell3D::FrontDmaReadStats(u32 track, VideoCommon::GpuSplit::ReadNeed nee
     }
     LOG_INFO(HW_GPU,
              "DMA read track (mode {}) {:.1f}s: reads {} | at once {} | waited for a writer {} | "
-             "full path: query page {}, GPU-written {}, unmapped {} | verify misses: at once {}, "
-             "waited {}",
-             track, seconds, stats.reads, stats.at_once, stats.waited, stats.full_query,
-             stats.full_gpu_written, stats.full_unmapped, stats.missed_at_once,
+             "query pages with results in memory {} | full path: results pending {}, "
+             "GPU-written {}, unmapped {} | verify misses: at once {}, waited {}",
+             track, seconds, stats.reads, stats.at_once, stats.waited, stats.query_written,
+             stats.full_query, stats.full_gpu_written, stats.full_unmapped, stats.missed_at_once,
              stats.missed_waited);
     stats = {};
     stats.since = now;

@@ -361,12 +361,11 @@ void GpuSplit::NoteQueryTarget(GPUVAddr address) {
     }
 }
 
-GpuSplit::ReadNeed GpuSplit::GuestReadNeeds(GPUVAddr address, u64 size, u64& target) {
+GpuSplit::ReadNeed GpuSplit::GuestReadNeeds(GPUVAddr address, u64 size, u64& target,
+                                            bool& query_page) {
     const GPUVAddr end = address + size;
     const auto query = std::lower_bound(query_pages.begin(), query_pages.end(), address >> 12);
-    if (query != query_pages.end() && *query <= ((end - 1) >> 12)) {
-        return ReadNeed::Full;
-    }
+    query_page = query != query_pages.end() && *query <= ((end - 1) >> 12);
     consumed_cache = consumed.load(std::memory_order_acquire);
     target = last_unknown_write > consumed_cache ? last_unknown_write : 0;
     size_t done = 0;

@@ -209,14 +209,16 @@ public:
         last_unknown_write = write_position;
     }
     /// The entry just sent releases a query whose result the query cache may hold back: reads of
-    /// that page keep the full path (drain and FlushPending) from now on.
+    /// that page also check the cache (RasterizerInterface::HasRegisteredQueries) from now on.
     void NoteQueryTarget(GPUVAddr address);
     enum class ReadNeed {
         None, ///< Nothing queued writes the range: read now
         Wait, ///< Wait for the back to reach `target`, then read
-        Full, ///< A query page: drain and flush the pending queries
+        Full, ///< Drain, flush and read (GPU-written pages, results still held back)
     };
-    [[nodiscard]] ReadNeed GuestReadNeeds(GPUVAddr address, u64 size, u64& target);
+    /// None or Wait; `query_page` when the range is on a page queries were released to.
+    [[nodiscard]] ReadNeed GuestReadNeeds(GPUVAddr address, u64 size, u64& target,
+                                          bool& query_page);
     /// Waits until the back executed everything up to `target`.
     void WaitForPosition(u64 target, DrainSite site) {
         WaitFor(target, site);

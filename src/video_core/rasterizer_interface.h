@@ -155,6 +155,12 @@ public:
 
     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
 
+    /// Any thread: whether the range may hold reports whose results are not in guest memory yet.
+    [[nodiscard]] virtual bool HasRegisteredQueries([[maybe_unused]] DAddr addr,
+                                                    [[maybe_unused]] u64 size) {
+        return true;
+    }
+
     /// Whether reports in the range wait for host query results not yet in guest memory.
     [[nodiscard]] virtual bool HasPendingQueries([[maybe_unused]] DAddr addr,
                                                  [[maybe_unused]] u64 size) {

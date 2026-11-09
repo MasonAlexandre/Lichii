@@ -3433,13 +3433,16 @@ private:
     void FrontNoteGuestWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                              u32 words, u32 cb_offset);
     VideoCommon::GpuSplit::ReadNeed FrontDmaReadNeed(VideoCommon::GpuSplit& split,
-                                                     GPUVAddr source, size_t size, u64& target);
+                                                     GPUVAddr source, size_t size, u64& target,
+                                                     bool& query_page);
+    bool FrontQueryResultsPending(GPUVAddr source, size_t size);
     void FrontDmaReadStats(u32 track, VideoCommon::GpuSplit::ReadNeed need, bool missed);
     // EDEN_NX2_DMA_READ_TRACK counters, logged every 2 s (front thread only).
     struct DmaReadStats {
         u64 reads{};
         u64 at_once{};
         u64 waited{};
+        u64 query_written{};
         u64 full_query{};
         u64 full_gpu_written{};
         u64 full_unmapped{};

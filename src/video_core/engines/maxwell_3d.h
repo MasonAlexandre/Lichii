@@ -8,6 +8,7 @@
 
 #include <array>
 #include <bitset>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -25,6 +26,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
@@ -3428,6 +3430,23 @@ private:
     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
+    void FrontNoteGuestWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                             u32 words, u32 cb_offset);
+    VideoCommon::GpuSplit::ReadNeed FrontDmaReadNeed(VideoCommon::GpuSplit& split,
+                                                     GPUVAddr source, size_t size, u64& target);
+    void FrontDmaReadStats(u32 track, VideoCommon::GpuSplit::ReadNeed need, bool missed);
+    // EDEN_NX2_DMA_READ_TRACK counters, logged every 2 s (front thread only).
+    struct DmaReadStats {
+        u64 reads{};
+        u64 at_once{};
+        u64 waited{};
+        u64 full_query{};
+        u64 full_gpu_written{};
+        u64 full_unmapped{};
+        u64 missed_at_once{};
+        u64 missed_waited{};
+        std::chrono::steady_clock::time_point since{};
+    } dma_read_stats;
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

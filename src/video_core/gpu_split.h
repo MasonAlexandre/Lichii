@@ -10,6 +10,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -115,6 +116,9 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (dma_read_track != 0) [[unlikely]] {
+            NoteMethod(engine, method);
+        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -125,10 +129,15 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+        if (dma_read_track != 0) [[unlikely]] {
+            NoteMethod(engine, method);
+        }
     }
 
     /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
     static constexpr u64 FastDrawNeutral = 1 << 7;
+    /// Defer flag (not stored): `func` writes no guest memory (EDEN_NX2_DMA_READ_TRACK).
+    static constexpr u64 NoGuestWrite = u64{1} << 62;
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
@@ -137,10 +146,13 @@ public:
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | (flags & ~NoGuestWrite) | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
+        if (dma_read_track != 0 && (flags & NoGuestWrite) == 0) [[unlikely]] {
+            NoteUnknownGuestWrite();
+        }
     }
     void DeferFunction(std::function<void()>&& func);
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
@@ -182,6 +194,33 @@ public:
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+
+    /// EDEN_NX2_DMA_READ_TRACK (front only): which queued work may write guest memory outside the
+    /// buffer cache, so a macro DMA read waits only for the work its words depend on. 0 drains
+    /// before every read; 1 waits for the last queued write to the read's range (or a write of
+    /// unknown range); 2 drains as 0 but counts reads that 1 would have read differently.
+    [[nodiscard]] u32 DmaReadTrack() const {
+        return dma_read_track;
+    }
+    /// The entry just sent writes guest memory [address, address + size) when it runs.
+    void NoteGuestWrite(GPUVAddr address, u64 size);
+    /// The entry just sent may write guest memory anywhere.
+    void NoteUnknownGuestWrite() {
+        last_unknown_write = write_position;
+    }
+    /// The entry just sent releases a query whose result the query cache may hold back: reads of
+    /// that page keep the full path (drain and FlushPending) from now on.
+    void NoteQueryTarget(GPUVAddr address);
+    enum class ReadNeed {
+        None, ///< Nothing queued writes the range: read now
+        Wait, ///< Wait for the back to reach `target`, then read
+        Full, ///< A query page: drain and flush the pending queries
+    };
+    [[nodiscard]] ReadNeed GuestReadNeeds(GPUVAddr address, u64 size, u64& target);
+    /// Waits until the back executed everything up to `target`.
+    void WaitForPosition(u64 target, DrainSite site) {
+        WaitFor(target, site);
+    }
 
 private:
     friend struct GpuSplitTestAccess;
@@ -253,6 +292,16 @@ private:
     std::unique_ptr<u64[]> ring;
 
     // Front side.
+    void NoteMethod(Tegra::Engines::EngineInterface* engine, u32 method);
+    struct PendingWrite {
+        GPUVAddr begin;
+        GPUVAddr end;
+        u64 position;
+    };
+    u32 dma_read_track{};
+    u64 last_unknown_write{};
+    std::vector<PendingWrite> pending_writes;
+    std::vector<u64> query_pages; ///< Sorted 4 KiB GPU pages
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};

@@ -44,6 +44,9 @@ public:
     }
 
     std::bitset<(std::numeric_limits<u16>::max)()> execution_mask{};
+    /// The engine notes the guest memory writes it sends to the split GPU thread itself
+    /// (GpuSplit::NoteGuestWrite); otherwise every executable method counts as one.
+    bool split_tracks_guest_writes{};
     /// A Maxwell3D whose CallMethod takes its fast path (Nx2Perf): GpuSplit's back calls it
     /// without the virtual call.
     bool fast_maxwell3d{};

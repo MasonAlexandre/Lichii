@@ -122,8 +122,16 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ++starts;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
-             front_macros ? ", macros on the first" : "");
+    // Only the front's macros read memory (FrontDmaRead), so the tracking needs them there.
+    const char* track = std::getenv("EDEN_NX2_DMA_READ_TRACK");
+    dma_read_track = front_macros && track != nullptr && (track[0] == '1' || track[0] == '2')
+                         ? static_cast<u32>(track[0] - '0')
+                         : 0;
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
+             front_macros ? ", macros on the first" : "",
+             dma_read_track == 1   ? ", macro DMA reads wait only for their writers"
+             : dma_read_track == 2 ? ", macro DMA read tracking verified against drains"
+                                   : "");
 }
 
 void GpuSplit::Stop() {
@@ -143,6 +151,10 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    dma_read_track = 0;
+    last_unknown_write = 0;
+    pending_writes.clear();
+    query_pages.clear();
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -298,6 +310,76 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+    // Which of the words are executable depends on incrementing; the 3D engine notes its own.
+    if (dma_read_track != 0 && !engine->split_tracks_guest_writes) [[unlikely]] {
+        NoteUnknownGuestWrite();
+    }
+}
+
+void GpuSplit::NoteMethod(Tegra::Engines::EngineInterface* engine, u32 method) {
+    // A method that isn't executable only latches a register; executable methods and macros of
+    // engines that don't note their writes may write memory (copies, uploads, semaphores).
+    if (!engine->split_tracks_guest_writes &&
+        (method >= 0xE00 || engine->execution_mask[method])) {
+        NoteUnknownGuestWrite();
+    }
+}
+
+void GpuSplit::NoteGuestWrite(GPUVAddr address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const GPUVAddr end = address + size;
+    // Constant buffer uploads arrive word by word in order: extend the last range.
+    if (!pending_writes.empty()) {
+        PendingWrite& last = pending_writes.back();
+        if (address <= last.end && end >= last.begin) {
+            last.begin = std::min(last.begin, address);
+            last.end = std::max(last.end, end);
+            last.position = write_position;
+            return;
+        }
+    }
+    if (pending_writes.size() >= 256) {
+        consumed_cache = consumed.load(std::memory_order_acquire);
+        std::erase_if(pending_writes,
+                      [this](const PendingWrite& write) { return write.position <= consumed_cache; });
+        if (pending_writes.size() >= 256) {
+            // Too many to keep apart: any later read waits for all of them.
+            last_unknown_write = std::max(last_unknown_write, pending_writes.back().position);
+            pending_writes.clear();
+        }
+    }
+    pending_writes.push_back({address, end, write_position});
+}
+
+void GpuSplit::NoteQueryTarget(GPUVAddr address) {
+    const u64 page = address >> 12;
+    const auto it = std::lower_bound(query_pages.begin(), query_pages.end(), page);
+    if (it == query_pages.end() || *it != page) {
+        query_pages.insert(it, page);
+    }
+}
+
+GpuSplit::ReadNeed GpuSplit::GuestReadNeeds(GPUVAddr address, u64 size, u64& target) {
+    const GPUVAddr end = address + size;
+    const auto query = std::lower_bound(query_pages.begin(), query_pages.end(), address >> 12);
+    if (query != query_pages.end() && *query <= ((end - 1) >> 12)) {
+        return ReadNeed::Full;
+    }
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    target = last_unknown_write > consumed_cache ? last_unknown_write : 0;
+    size_t done = 0;
+    while (done < pending_writes.size() && pending_writes[done].position <= consumed_cache) {
+        ++done;
+    }
+    pending_writes.erase(pending_writes.begin(), pending_writes.begin() + done);
+    for (const PendingWrite& write : pending_writes) {
+        if (write.begin < end && address < write.end) {
+            target = std::max(target, write.position);
+        }
+    }
+    return target != 0 ? ReadNeed::Wait : ReadNeed::None;
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {

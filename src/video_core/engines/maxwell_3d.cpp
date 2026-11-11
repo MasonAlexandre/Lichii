@@ -9,6 +9,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -902,6 +903,18 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    // Diagnostic: ignore the game's render-enable predicate and draw everything. Used to test
+    // whether a stale or zero occlusion result is suppressing whole passes.
+    static const bool force_render = std::getenv("EDEN_NX2_FORCE_RENDER_ENABLE") != nullptr;
+    if (force_render) {
+        static std::atomic_bool logged{false};
+        if (!logged.exchange(true)) {
+            LOG_WARNING(HW_GPU, "EDEN_NX2_FORCE_RENDER_ENABLE: conditional rendering disabled, "
+                                "all draws execute");
+        }
+        execute_on = true;
+        return;
+    }
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;

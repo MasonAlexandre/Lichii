@@ -12,6 +12,7 @@
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/vfs/vfs_vector.h"
@@ -206,10 +207,7 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
                                                       NupContainer::PackageKind::Addon;
                                            });
     if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
+        LOG_INFO(Loader, "NUP container has {} add-on content package(s)", addon_count);
     }
 }
 
@@ -228,6 +226,17 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
     }
     if (!has_program || secondary_loader == nullptr) {
         return {ResultStatus::ErrorNUPNoBasePackage, {}};
+    }
+
+    // The NUP's own add-ons (a Switch 2 Edition's upgrade pack): the game list registers them
+    // when it scans the game folders, but not for a game started some other way.
+    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
+            FileSys::ContentProviderUnionSlot::FrontendManual)) {
+        auto& provider = *const_cast<FileSys::ManualContentProvider*>(
+            static_cast<const FileSys::ManualContentProvider*>(slot));
+        if (provider.AddEntriesFromContainer(file, false, base_title_id)) {
+            LOG_INFO(Loader, "Registered the NUP's add-on content for {:016X}", base_title_id);
+        }
     }
 
     const auto result = secondary_loader->Load(process, system);

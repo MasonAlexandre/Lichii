@@ -12,7 +12,10 @@ namespace VideoCommon::DlssContract {
 constexpr bool ValidColorFormats(VideoCore::Surface::PixelFormat input,
                                   VideoCore::Surface::PixelFormat output, bool use_history) {
     using VideoCore::Surface::PixelFormat;
+    // The Xenoblade Switch 2 Editions upscale their B10G11R11 frame (already in 0..1) into an
+    // RGBA8 output; the history stays half-float whatever the output.
     return (input == PixelFormat::B10G11R11_FLOAT && output == input) ||
+           (input == PixelFormat::B10G11R11_FLOAT && output == PixelFormat::A8B8G8R8_UNORM) ||
            (!use_history && input == PixelFormat::A8B8G8R8_SRGB &&
             output == PixelFormat::R16G16B16A16_FLOAT);
 }
@@ -22,6 +25,13 @@ constexpr bool IsUpscalerDepthFormat(VideoCore::Surface::PixelFormat format) {
     using VideoCore::Surface::PixelFormat;
     return format == PixelFormat::D32_FLOAT || format == PixelFormat::D24_UNORM_S8_UINT ||
            format == PixelFormat::S8_UINT_D24_UNORM;
+}
+
+/// The NVN2 DLSS replacement (Xenoblade Switch 2 Editions) also takes D32 with stencil, through
+/// its depth-only view.
+constexpr bool IsUpscalerDepthFormat(VideoCore::Surface::PixelFormat format, bool dlss_to_fsr) {
+    return IsUpscalerDepthFormat(format) ||
+           (dlss_to_fsr && format == VideoCore::Surface::PixelFormat::D32_FLOAT_S8_UINT);
 }
 
 constexpr std::uint64_t FastFusionProgramId = 0x040041E0212AE000ULL;

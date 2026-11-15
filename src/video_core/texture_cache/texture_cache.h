@@ -3120,8 +3120,10 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         PrepareImage(dst_id, true, false);
         if (depth_id) {
             PrepareImage(depth_id, false, false);
+            // D32 with stencil (Xenoblade Chronicles 2) is read through a depth-only view.
             if (slot_images[depth_id].info.num_samples != 1 ||
-                !VideoCommon::DlssContract::IsUpscalerDepthFormat(slot_images[depth_id].info.format)) {
+                !VideoCommon::DlssContract::IsUpscalerDepthFormat(slot_images[depth_id].info.format,
+                                                                   Settings::values.nx2_dlss_to_fsr)) {
                 return false;
             }
         }

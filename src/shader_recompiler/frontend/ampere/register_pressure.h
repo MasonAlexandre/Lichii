@@ -200,7 +200,9 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     case 0xa11:
         operand(16);
         operand(24);
-        operand(64);
+        if (input.Bits(80, 1)) { // Rc is only read by LEA.HI
+            operand(64);
+        }
         break;
     case 0x225:
     case 0x227:

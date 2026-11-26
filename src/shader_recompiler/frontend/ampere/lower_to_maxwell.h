@@ -1606,7 +1606,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 mask = insn.Bits(72, 4);
             const u32 mode = insn.words[2] & ~0xf00U;
             const u32 reserved = uses_uniform_bank ? high_uniform_base : 246U;
-            const bool strong = mode == 0x0010a000; // Strong stores are fenced on both sides.
+            // Bits 77-80 are the memory order, as for SULD.P: 5/7/10 strong CTA/GPU/system.
+            // Strong stores are fenced on both sides.
+            const u32 order = insn.Bits(77, 4);
+            static const bool strong_stores = [] {
+                const char* value = std::getenv("EDEN_NX2_SULD_STRONG");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool strong = mode == 0x0010a000 ||
+                                (strong_stores && (mode & ~0x1e000U) == 0x00100000 &&
+                                 (order == 7 || order == 10));
             if (!mask || (mode != 0x00100000 && !strong) || dimension == 2 || dimension > 5 ||
                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 ||
                 coordinate > (dimension >= 4 ? 252U : dimension == 3 ? 253U : 254U) ||

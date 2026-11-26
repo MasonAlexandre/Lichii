@@ -4229,9 +4229,10 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
         info.maxwell_gob_layout = !image_id;
     }
     if (native && !image_id && info.maxwell_gob_layout && info.type != ImageType::e3D &&
-        info.format != PixelFormat::R8_UNORM && !VideoCore::Surface::IsPixelFormatBCn(info.format) &&
+        !VideoCore::Surface::IsPixelFormatBCn(info.format) &&
         UsesXenobladeLutLayout(Settings::GetCurrentProgramID())) {
-        // Xenoblade hints its render targets too, and those are drawn in the native layout.
+        // Xenoblade hints its render targets too (R8 masks included), and those are drawn in the
+        // native layout. Font atlases and other uploaded textures have no GPU-written image.
         ImageInfo native_info = info;
         native_info.maxwell_gob_layout = false;
         const size_t size = CalculateGuestSizeInBytes(native_info);

@@ -167,7 +167,10 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
         resources.layers = config.BaseLayer() + 6;
         break;
     case TextureType::TextureCubeArray:
-        UNIMPLEMENTED_IF(config.load_store_hint != 0 && !maxwell_gob_layout);
+        if (config.load_store_hint != 0 && !maxwell_gob_layout) {
+            LOG_WARNING(HW_GPU, "Load/store hinted cube array read as native: {} {}x{}", format,
+                        config.Width(), config.Height());
+        }
         type = ImageType::e2D;
         size.width = config.Width();
         size.height = config.Height();

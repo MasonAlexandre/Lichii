@@ -36,6 +36,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/writeback_switches.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -4250,10 +4251,26 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];
-    const std::optional<SubresourceBase> found_base = image.TryFindBase(config.Address());
+    std::optional<SubresourceBase> found_base = image.TryFindBase(config.Address());
     if (!found_base) {
-        LOG_WARNING(HW_GPU, "No subresource of image {:#x} at {:#x}, dropping the view",
-                    image.gpu_addr, config.Address());
+        // FindImage matches by CPU address, so the image can sit at another GPU alias of the
+        // same memory. Look the subresource up by its offset in that memory instead.
+        if (const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(config.Address());
+            cpu_addr && *cpu_addr >= image.cpu_addr) {
+            found_base = image.TryFindBase(image.gpu_addr + (*cpu_addr - image.cpu_addr));
+        }
+    }
+    if (!found_base) {
+        static u32 dropped{};
+        if (dropped++ < 64) {
+            LOG_WARNING(HW_GPU,
+                        "No subresource of image {:#x} (cpu {:#x}, {} {}x{}x{}, {} levels, {} "
+                        "layers, native {}) at {:#x} ({} {}x{}), dropping the view",
+                        image.gpu_addr, image.cpu_addr, image.info.format, image.info.size.width,
+                        image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                        image.info.resources.layers, image.info.native_tiling, config.Address(),
+                        info.format, info.size.width, info.size.height);
+        }
         return NULL_IMAGE_VIEW_ID;
     }
     const SubresourceBase base = *found_base;

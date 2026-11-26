@@ -4227,6 +4227,22 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
         }
         info.maxwell_gob_layout = !image_id;
     }
+    if (native && !image_id && info.maxwell_gob_layout && info.type != ImageType::e3D &&
+        info.format != PixelFormat::R8_UNORM && !VideoCore::Surface::IsPixelFormatBCn(info.format) &&
+        UsesXenobladeLutLayout(Settings::GetCurrentProgramID())) {
+        // Xenoblade hints its render targets too, and those are drawn in the native layout.
+        ImageInfo native_info = info;
+        native_info.maxwell_gob_layout = false;
+        const size_t size = CalculateGuestSizeInBytes(native_info);
+        bool gpu_written = false;
+        if (const std::optional<DAddr> cpu_addr = ImageCpuAddress(image_gpu_addr, size)) {
+            ForEachImageInRegion(*cpu_addr, size, [&](ImageId, ImageBase& other) {
+                gpu_written |= other.info.native_tiling &&
+                               True(other.flags & ImageFlagBits::GpuModified);
+            });
+        }
+        info.maxwell_gob_layout = !gpu_written;
+    }
     if (!image_id) {
         image_id = FindOrInsertImage(info, image_gpu_addr, RelaxedOptions{}, &retry);
     }

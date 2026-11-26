@@ -1,0 +1,151 @@
+name: test-build
+
+# Windows-only test builds for fix branches: no ThinLTO or PGO, and a compiler cache saved per
+# branch on every run, so a rebuild only recompiles what changed.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - xenoblade-de-fix
+    paths:
+      - "src/**"
+      - "!src/tests/**"
+      - "CMakeLists.txt"
+      - "CMakeModules/**"
+      - "externals/**"
+      - "dist/**"
+      - "cpmfile.json"
+      - ".github/workflows/test-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows-x86_64 test binary
+    runs-on: windows-2022
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts qtimageformats
+          cache: true
+
+      - name: Install ccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+              throw 'ccache checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Restore CPM downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-windows-x86_64-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-windows-x86_64-v2-
+            cpm-Windows-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: testobj-windows-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            testobj-windows-${{ github.ref_name }}-
+            testobj-windows-
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DLICHII_TESTS=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
+            -DENABLE_FLYHIGH=ON \
+            -DENABLE_QT_TRANSLATION=OFF \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DLICHII_BUILD_TAG=test-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX" \
+            "-DCMAKE_CXX_FLAGS=-EHsc -DWIN32 -D_WINDOWS -DNOMINMAX"
+
+      - name: Build
+        shell: bash
+        env:
+          CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
+        run: |
+          ccache --zero-stats
+          cmake --build build/release --target lichii lichii-cmd --parallel
+          ccache --show-stats
+
+      - name: Save compiler objects
+        if: ${{ !cancelled() && steps.compiler-cache.outcome == 'success' }}
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: testobj-windows-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          foreach ($file in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$file" -PathType Leaf)) {
+              throw "build/release/bin/$file was not produced"
+            }
+          }
+          Remove-Item -ErrorAction SilentlyContinue build/release/bin/*.pdb
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+          $excluded = 'flyhighfg.bin', 'flyhighfg.json', 'graph.json', 'models.json', 'WEIGHTS_LICENSE.md'
+          Get-ChildItem -Recurse -File build/release/bin | Where-Object { $_.Name -in $excluded } | Remove-Item
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-test-windows-x86_64-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7

@@ -82,6 +82,7 @@ struct Counters {
     std::atomic<u8> wait_kind{};
     std::atomic<u32> svc{}; ///< The thread's last SVC: what it waits in
     Totals<ThreadFields> totals{};
+    Totals<256> svc_counts{}; ///< SVCs by number
 };
 
 namespace {
@@ -89,6 +90,7 @@ namespace {
 struct Entry {
     std::unique_ptr<Counters> counters;
     Snapshot<ThreadFields> previous{};
+    Snapshot<256> svc_previous{};
 };
 
 std::mutex g_registry_mutex;
@@ -173,14 +175,16 @@ void Report(u64 now) {
     struct Row {
         const Counters* counters;
         Snapshot<ThreadFields> delta;
+        Snapshot<256> svcs;
     };
     std::vector<Row> rows;
     {
         std::scoped_lock lk{g_registry_mutex};
         for (auto& entry : g_registry) {
             const auto delta = Delta(entry.counters->totals, entry.previous);
+            const auto svcs = Delta(entry.counters->svc_counts, entry.svc_previous);
             if (delta[OnCore] != 0 || delta[Jit] != 0) {
-                rows.push_back({entry.counters.get(), delta});
+                rows.push_back({entry.counters.get(), delta, svcs});
             }
         }
     }
@@ -222,6 +226,21 @@ void Report(u64 now) {
                  ms(d[HintSpin]), ms(d[Memory]), per_frame(d[MemoryCalls]), ms(d[ReadBack]),
                  per_frame(d[ReadBacks]), ms(outside), per_frame(d[Svcs]), ms(d[Ready]),
                  ms(waited), waits);
+        // The SVCs this thread made most, by number, per frame.
+        std::array<std::pair<u64, u32>, 256> by_count;
+        for (u32 n = 0; n < 256; ++n) {
+            by_count[n] = {rows[i].svcs[n], n};
+        }
+        std::partial_sort(by_count.begin(), by_count.begin() + 6, by_count.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string top;
+        for (size_t n = 0; n < 6 && by_count[n].first != 0; ++n) {
+            top += fmt::format("{}{:#04x} {:.1f}", n == 0 ? "" : ", ", by_count[n].second,
+                               per_frame(by_count[n].first));
+        }
+        if (!top.empty()) {
+            LOG_INFO(Kernel, "    t{} SVCs per frame by number: {}", c.thread_id, top);
+        }
     }
 
     for (size_t core = 0; core < g_cores.size(); ++core) {
@@ -308,6 +327,7 @@ void EndRun(KThread* thread, size_t core, u64 start, u64 end, Exit exit, u32 svc
         Add(t[ReadBacks], run.read_backs);
         if (exit == Exit::Svc) {
             Add(t[Svcs], 1);
+            Add(counters->svc_counts[svc & 0xff], 1);
             counters->svc.store(svc, std::memory_order_relaxed);
         }
     }

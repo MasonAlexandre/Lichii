@@ -28,6 +28,36 @@ using Tegra::Texture::TICEntry;
 using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::SurfaceType;
 
+// Hinted textures are stored in the Maxwell GOB layout. Monolith's Switch 2 Editions also hint
+// their other BCn textures and their R8 font atlases, which read as native scramble in 16-byte units.
+[[nodiscard]] static bool HonorsMaxwellGobHint(PixelFormat format, u64 program_id) {
+    if (format == PixelFormat::BC7_UNORM || format == PixelFormat::BC7_SRGB) {
+        return true;
+    }
+    if (program_id != 0x0400FF500E34A001ULL && program_id != 0x0400E95004038001ULL &&
+        program_id != 0x0400453019AA8001ULL) {
+        return false;
+    }
+    switch (format) {
+    case PixelFormat::R8_UNORM:
+    case PixelFormat::BC1_RGBA_UNORM:
+    case PixelFormat::BC1_RGBA_SRGB:
+    case PixelFormat::BC2_UNORM:
+    case PixelFormat::BC2_SRGB:
+    case PixelFormat::BC3_UNORM:
+    case PixelFormat::BC3_SRGB:
+    case PixelFormat::BC4_UNORM:
+    case PixelFormat::BC4_SNORM:
+    case PixelFormat::BC5_UNORM:
+    case PixelFormat::BC5_SNORM:
+    case PixelFormat::BC6H_UFLOAT:
+    case PixelFormat::BC6H_SFLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 constexpr u32 RescaleHeightThreshold = 288;
 constexpr u32 DownscaleHeightThreshold = 512;
 
@@ -48,7 +78,7 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
         };
         maxwell_gob_layout = config.load_store_hint != 0 &&
                              config.texture_type != TextureType::Texture3D &&
-                             (format == PixelFormat::BC7_UNORM || format == PixelFormat::BC7_SRGB);
+                             HonorsMaxwellGobHint(format, Settings::GetCurrentProgramID());
     }
     rescaleable = false;
     is_sparse = config.is_sparse != 0;

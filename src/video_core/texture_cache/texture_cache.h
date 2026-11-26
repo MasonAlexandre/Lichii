@@ -4247,7 +4247,8 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
     if (!image_id) {
         image_id = FindOrInsertImage(info, image_gpu_addr, RelaxedOptions{}, &retry);
     }
-    if (!image_id) {
+    // A deferred lookup (retry) returns the null image: the caller tries the descriptor again.
+    if (!image_id || image_id == NULL_IMAGE_ID || retry) {
         return NULL_IMAGE_VIEW_ID;
     }
     ImageBase& image = slot_images[image_id];

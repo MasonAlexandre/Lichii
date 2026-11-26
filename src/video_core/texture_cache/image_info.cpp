@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdlib>
+#include <string_view>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -13,6 +16,7 @@
 #include "common/settings.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/format_lookup_table.h"
+#include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/types.h"
@@ -28,8 +32,9 @@ using Tegra::Texture::TICEntry;
 using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::SurfaceType;
 
-// Hinted textures are stored in the Maxwell GOB layout. Monolith's Switch 2 Editions also hint
-// their other BCn textures and their R8 font atlases, which read as native scramble in 16-byte units.
+// Hinted textures are stored in the Maxwell GOB layout. Monolith's Switch 2 Editions hint more
+// than BC7 (font atlases, UI images, BCn); read as native they scramble in 16-byte units.
+// EDEN_NX2_XENO_GOB=bc limits Xenoblade to R8 and BCn, the previous set.
 [[nodiscard]] static bool HonorsMaxwellGobHint(PixelFormat format, u64 program_id) {
     if (format == PixelFormat::BC7_UNORM || format == PixelFormat::BC7_SRGB) {
         return true;
@@ -37,6 +42,13 @@ using VideoCore::Surface::SurfaceType;
     if (program_id != 0x0400FF500E34A001ULL && program_id != 0x0400E95004038001ULL &&
         program_id != 0x0400453019AA8001ULL) {
         return false;
+    }
+    static const bool bcn_only = [] {
+        const char* value = std::getenv("EDEN_NX2_XENO_GOB");
+        return value != nullptr && std::string_view{value} == "bc";
+    }();
+    if (!bcn_only) {
+        return VideoCore::Surface::GetFormatType(format) == SurfaceType::ColorTexture;
     }
     switch (format) {
     case PixelFormat::R8_UNORM:
@@ -56,6 +68,18 @@ using VideoCore::Surface::SurfaceType;
     default:
         return false;
     }
+}
+
+// Each hinted format once, to tell which formats a title hints.
+static void LogHintedFormat(PixelFormat format, TextureType type, u32 width, u32 height,
+                            bool honored) {
+    static std::array<std::atomic_flag, VideoCore::Surface::MaxPixelFormat> logged{};
+    const auto index = static_cast<size_t>(format);
+    if (index >= logged.size() || logged[index].test_and_set(std::memory_order_relaxed)) {
+        return;
+    }
+    LOG_INFO(HW_GPU, "Load/store hinted texture: format {} type {} {}x{}, Maxwell GOB layout {}",
+             format, static_cast<u32>(type), width, height, honored);
 }
 
 constexpr u32 RescaleHeightThreshold = 288;
@@ -79,6 +103,10 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
         maxwell_gob_layout = config.load_store_hint != 0 &&
                              config.texture_type != TextureType::Texture3D &&
                              HonorsMaxwellGobHint(format, Settings::GetCurrentProgramID());
+        if (config.load_store_hint != 0) {
+            LogHintedFormat(format, config.texture_type, config.Width(), config.Height(),
+                            maxwell_gob_layout);
+        }
     }
     rescaleable = false;
     is_sparse = config.is_sparse != 0;

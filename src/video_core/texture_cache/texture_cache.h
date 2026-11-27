@@ -4230,6 +4230,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
         }
         info.maxwell_gob_layout = !image_id;
     }
+    bool xenoblade_gob_copy = false;
     if (native && !image_id && info.maxwell_gob_layout && info.type != ImageType::e3D &&
         !VideoCore::Surface::IsPixelFormatBCn(info.format) &&
         UsesXenobladeLutLayout(Settings::GetCurrentProgramID())) {
@@ -4246,6 +4247,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
             });
         }
         info.maxwell_gob_layout = !gpu_written;
+        xenoblade_gob_copy = info.maxwell_gob_layout;
     }
     if (!image_id) {
         image_id = FindOrInsertImage(info, image_gpu_addr, RelaxedOptions{}, &retry);
@@ -4284,7 +4286,11 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config, bool& r
     ImageViewBase& image_view = slot_image_views[image_view_id];
     image_view.flags |= ImageViewFlagBits::Strong;
     image.flags |= ImageFlagBits::Strong;
-    image.xenoblade_lut_view |= xenoblade_lut;
+    // A GOB-order view of an image no GPU write covered yet: once one does (a render target the
+    // game sampled before drawing to it, as its title screen does on a fresh boot), drop the view
+    // so the next lookup takes the GPU-written image.
+    image.xenoblade_lut_view |=
+        xenoblade_lut || (xenoblade_gob_copy && False(image.flags & ImageFlagBits::GpuModified));
     return image_view_id;
 }
 

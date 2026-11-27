@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(ARCHITECTURE_x86_64)
+#include <immintrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/atomic_ops.h"
@@ -45,6 +49,58 @@
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_download_area.h"
+
+namespace {
+// EDEN_NX2_GUEST_THREAD_STATS: where the time of each CPU write to GPU-cached memory goes, per
+// core, in host TSC ticks (x86-64 only).
+struct RasterizerWriteStats {
+    u64 calls, new_pages, total, begin, translate, on_cpu_write, collect, await, end;
+    u64 window_tsc;
+    std::chrono::steady_clock::time_point window_start;
+};
+std::array<RasterizerWriteStats, Core::Hardware::NUM_CPU_CORES> g_write_stats{};
+
+inline u64 WriteStatsTsc() {
+#if defined(ARCHITECTURE_x86_64)
+    return __rdtsc();
+#else
+    return 0;
+#endif
+}
+
+void ReportWriteStats(size_t core) {
+    auto& w = g_write_stats[core];
+    const auto now = std::chrono::steady_clock::now();
+    const u64 tsc = WriteStatsTsc();
+    if (w.window_start == std::chrono::steady_clock::time_point{}) {
+        w = {};
+        w.window_start = now;
+        w.window_tsc = tsc;
+        return;
+    }
+    if (now - w.window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - w.window_start).count();
+    const double ns_per_tick = seconds * 1e9 / static_cast<double>((std::max)(tsc - w.window_tsc, u64{1}));
+    const auto per = [&](u64 ticks, u64 count) {
+        return count == 0 ? 0.0 : static_cast<double>(ticks) * ns_per_tick / static_cast<double>(count);
+    };
+    if (w.calls != 0) {
+        LOG_INFO(HW_Memory,
+                 "CPU writes to GPU-cached memory on core {} over {:.1f} s: {} ({:.0f}/s, {} on a new "
+                 "page), {:.2f} ms/s; ns per write: total {:.1f}, begin {:.1f}, translate {:.1f}, "
+                 "collect {:.1f}, await {:.1f}, end {:.1f}; OnCPUWrite {:.1f} ns per new page",
+                 core, seconds, w.calls, static_cast<double>(w.calls) / seconds, w.new_pages,
+                 static_cast<double>(w.total) * ns_per_tick / seconds / 1e6, per(w.total, w.calls),
+                 per(w.begin, w.calls), per(w.translate, w.calls), per(w.collect, w.calls),
+                 per(w.await, w.calls), per(w.end, w.calls), per(w.on_cpu_write, w.new_pages));
+    }
+    w = {};
+    w.window_start = now;
+    w.window_tsc = tsc;
+}
+} // namespace
 
 namespace Core::Memory {
 
@@ -1083,20 +1139,40 @@ struct Memory::Impl {
 
     /// Callers store the bytes after this and call EndRasterizerWrite once they landed.
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
-        VideoCommon::Nx2FastDraw::BeginMemoryChange();
         if (!Kernel::Nx2ThreadStats::g_enabled) {
+            VideoCommon::Nx2FastDraw::BeginMemoryChange();
             WriteToRasterizer(v_address, size);
             return;
         }
+        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
+                                       Core::Hardware::NUM_CPU_CORES - 1);
+        auto& w = g_write_stats[core];
+        const u64 t0 = WriteStatsTsc();
+        VideoCommon::Nx2FastDraw::BeginMemoryChange();
+        const u64 t1 = WriteStatsTsc();
+        w.begin += t1 - t0;
         auto& timing = system.CoreTiming();
         const u64 start = timing.GetClockTicks();
         WriteToRasterizer(v_address, size);
         Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
                                             timing.GetClockTicks() - start, false);
+        ++w.calls;
+        w.total += WriteStatsTsc() - t0;
     }
 
     void EndRasterizerWrite() {
+        if (!Kernel::Nx2ThreadStats::g_enabled) {
+            VideoCommon::Nx2FastDraw::EndMemoryChange();
+            return;
+        }
+        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
+                                       Core::Hardware::NUM_CPU_CORES - 1);
+        const u64 t0 = WriteStatsTsc();
         VideoCommon::Nx2FastDraw::EndMemoryChange();
+        const u64 elapsed = WriteStatsTsc() - t0;
+        g_write_stats[core].end += elapsed;
+        g_write_stats[core].total += elapsed;
+        ReportWriteStats(core);
     }
 
     void WriteToRasterizer(VAddr v_address, size_t size) {
@@ -1121,7 +1197,17 @@ struct Memory::Impl {
                 sys_core_guard.unlock();
             }
         };
+        const bool stats = Kernel::Nx2ThreadStats::g_enabled;
+        u64 mark = stats ? WriteStatsTsc() : 0;
+        const auto lap = [&](u64 RasterizerWriteStats::*field) {
+            if (stats) {
+                const u64 now = WriteStatsTsc();
+                g_write_stats[core].*field += now - mark;
+                mark = now;
+            }
+        };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            lap(&RasterizerWriteStats::translate);
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> LICHII_PAGEBITS;
             // Performance note:
@@ -1132,6 +1218,10 @@ struct Memory::Impl {
                 // Short circuit the need to check for address/size
                 auto const do_collection = (address != 0 && size != 0)
                     && system.GPU().OnCPUWrite(address, size);
+                if (stats) {
+                    ++g_write_stats[core].new_pages;
+                }
+                lap(&RasterizerWriteStats::on_cpu_write);
                 if (do_collection) {
                     current_area.last_address = subaddress;
                 } else {
@@ -1139,9 +1229,11 @@ struct Memory::Impl {
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
+            lap(&RasterizerWriteStats::collect);
             // A download writing to guest memory here may have looked at the collected writes
             // before this one: its bytes would land over the ones stored after this returns.
             VideoCore::DownloadLanding::Await(address, size);
+            lap(&RasterizerWriteStats::await);
         });
     }
 

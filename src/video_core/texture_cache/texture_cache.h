@@ -6078,9 +6078,18 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     }
     for (ImageId other_id : image.overlapping_images) {
         ImageBase& other = slot_images[other_id];
-        if (image.info.native_tiling != other.info.native_tiling) {
-            InvalidateXenobladeLutViews(other);
+        if (image.info.native_tiling == other.info.native_tiling) {
+            continue;
         }
+        // A 2D GOB-order copy is only dropped when this write's image covers all of it: then its
+        // next lookup finds this image instead. A partly overlapping copy would be looked up into
+        // the GOB order again and invalidated on every write, rebuilding the image tables each
+        // frame.
+        if (other.info.type != ImageType::e3D &&
+            (other.cpu_addr < image.cpu_addr || other.cpu_addr_end > image.cpu_addr_end)) {
+            continue;
+        }
+        InvalidateXenobladeLutViews(other);
     }
 }
 

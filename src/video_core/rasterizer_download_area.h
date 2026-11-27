@@ -79,7 +79,14 @@ public:
     /// A guest CPU write of [addr, addr + size) was collected: returns once its bytes may be
     /// stored.
     static void Await(DAddr addr, u64 size) noexcept {
+#if defined(ARCHITECTURE_x86_64)
+        // The same full barrier as a seq_cst fence on x86, without the mfence: a locked add to a
+        // line no other thread touches.
+        thread_local std::atomic<u32> barrier{};
+        barrier.fetch_add(1, std::memory_order_seq_cst);
+#else
         std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
         const u64 sequence = state.sequence.load(std::memory_order_acquire);
         if ((sequence & 1) != 0) {
             Wait(sequence, addr, size);

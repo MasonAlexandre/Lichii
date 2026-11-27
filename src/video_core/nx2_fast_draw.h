@@ -144,9 +144,15 @@ inline u64 g_handles_sync_serial{}; ///< SyncSerial at NoteHandlesRead (the thre
 
 /// Any thread, before a change EndMemoryChange flags (guest CPU writes, watched page changes).
 inline void BeginMemoryChange() {
+#if defined(ARCHITECTURE_x86_64)
+    // A locked add is a full barrier on x86: the separate fence after it only cost an mfence on
+    // each CPU write to GPU-cached memory (about a million a second in Xenoblade).
+    g_changes_landing.fetch_add(1, std::memory_order_seq_cst);
+#else
     g_changes_landing.fetch_add(1, std::memory_order_relaxed);
     // Visible before the bytes: a comparison that finds them finds the change landing too.
     std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
 }
 
 /// Once the change landed. `changed` false ends a BeginMemoryChange that changed nothing.

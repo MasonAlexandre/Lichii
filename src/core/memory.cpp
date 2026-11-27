@@ -1144,8 +1144,8 @@ struct Memory::Impl {
             WriteToRasterizer(v_address, size);
             return;
         }
-        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                       Core::Hardware::NUM_CPU_CORES - 1);
+        const size_t core = (std::min)(static_cast<size_t>(system.GetCurrentHostThreadID()),
+                                       static_cast<size_t>(Core::Hardware::NUM_CPU_CORES - 1));
         auto& w = g_write_stats[core];
         const u64 t0 = WriteStatsTsc();
         VideoCommon::Nx2FastDraw::BeginMemoryChange();
@@ -1165,8 +1165,8 @@ struct Memory::Impl {
             VideoCommon::Nx2FastDraw::EndMemoryChange();
             return;
         }
-        const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                       Core::Hardware::NUM_CPU_CORES - 1);
+        const size_t core = (std::min)(static_cast<size_t>(system.GetCurrentHostThreadID()),
+                                       static_cast<size_t>(Core::Hardware::NUM_CPU_CORES - 1));
         const u64 t0 = WriteStatsTsc();
         VideoCommon::Nx2FastDraw::EndMemoryChange();
         const u64 elapsed = WriteStatsTsc() - t0;

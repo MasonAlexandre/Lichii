@@ -417,6 +417,8 @@ void BufferCache<P>::CountTrap(DAddr device_addr) {
         --it;
         if (it->second.end > device_addr) {
             ++it->second.traps;
+            const u64 span = it->second.end - it->first;
+            ++it->second.histogram[std::min<u64>((device_addr - it->first) * 16 / span, 15)];
             ++trap_by_kind[it->second.source.kind < trap_by_kind.size() ? it->second.source.kind
                                                                           : 0];
             found = true;
@@ -455,11 +457,17 @@ void BufferCache<P>::CountTrap(DAddr device_addr) {
         return a.second->traps > b.second->traps;
     });
     std::string tops;
+    static constexpr std::array<const char*, 4> extents{"-", "reach unknown", "constant reach",
+                                                        "reach with strides"};
     for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
         const auto& [addr, rec] = top[i];
-        tops += fmt::format("\n  {:#x}+{:#x} (buffer {:#x}) {} stage {} index {}: {} traps, {} marks",
-                            addr, rec->end - addr, rec->buffer_size, names[rec->source.kind],
-                            rec->source.stage, rec->source.index, rec->traps, rec->marks);
+        tops += fmt::format(
+            "\n  {:#x}+{:#x} (buffer {:#x}) {} stage {} index {} extent {}: {} traps, {} marks",
+            addr, rec->end - addr, rec->buffer_size, names[rec->source.kind], rec->source.stage,
+            rec->source.index, extents[rec->source.extent & 3], rec->traps, rec->marks);
+        if (i < 3) {
+            tops += fmt::format("; traps per 1/16 of the mark: {}", fmt::join(rec->histogram, " "));
+        }
     }
     LOG_INFO(HW_GPU,
              "Trapped CPU writes to GPU-written buffer pages over 10 s: {} new-page traps, {} with "
@@ -470,6 +478,7 @@ void BufferCache<P>::CountTrap(DAddr device_addr) {
     for (auto& [addr, rec] : trap_marks) {
         rec.traps = 0;
         rec.marks = 0;
+        rec.histogram.fill(0);
     }
     trap_window_start = now;
 }
@@ -2084,7 +2093,8 @@ void BufferCache<P>::UnbindGraphicsStorageBuffers(size_t stage) {
 template <class P>
 bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index,
                                                u32 cbuf_offset, bool is_written,
-                                               u32 indirect_offset) {
+                                               u32 indirect_offset,
+                                               const Shader::StorageWriteExtent& write_extent) {
     if (stage >= NUM_STAGES || ssbo_index >= NUM_STORAGE_BUFFERS) {
         LOG_ERROR(HW_GPU, "Invalid graphics storage buffer binding: stage {}, index {}",
                   stage, ssbo_index);
@@ -2145,6 +2155,44 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
     channel_state->storage_buffers[stage][ssbo_index] =
         StorageBufferBinding(ssbo_addr, cbuf_index, is_written, native || indirect, indirect,
                              false, sized);
+    // How much of the binding the draw marks GPU-written. A native pointer has no size, so the
+    // binding runs up to 8 MiB past it, and marking all of it traps every CPU write to those pages
+    // (Xenoblade DE streams its per-draw data behind a vertex program's written pointer). A draw
+    // has no invocation ids the extent can scale with, so only stores at constant offsets past
+    // the pointer bound it.
+    {
+        const Binding& binding = channel_state->storage_buffers[stage][ssbo_index];
+        u64 mark = ~u64{0}; // all of the binding, whatever size it is bound with
+        const u64 bit = u64{1} << ssbo_index;
+        auto& unbounded = channel_state->unbounded_graphics_storage_writes[stage];
+        unbounded &= ~bit;
+        if (native && is_written && binding.size != 0) {
+            const bool constant =
+                write_extent.bounded &&
+                std::ranges::all_of(write_extent.local_stride, [](u32 v) { return v == 0; }) &&
+                std::ranges::all_of(write_extent.group_stride, [](u32 v) { return v == 0; }) &&
+                (!write_extent.guarded ||
+                 (write_extent.guard_const < 0x10000 &&
+                  std::ranges::all_of(write_extent.guard_local_stride,
+                                      [](u32 v) { return v == 0; }) &&
+                  std::ranges::all_of(write_extent.guard_group_stride,
+                                      [](u32 v) { return v == 0; })));
+            if (constant && Settings::values.native_compute_write_mark.GetValue() ==
+                                Settings::NativeComputeWriteMark::Auto) {
+                const GPUVAddr pointer = gpu_memory->Read<u64>(ssbo_addr);
+                const u64 pad = pointer >= binding.gpu_addr ? pointer - binding.gpu_addr : 0;
+                mark = std::min<u64>(binding.size, pad + write_extent.const_end);
+            } else if (!constant) {
+                unbounded |= bit;
+            }
+            graphics_mark_extent[stage][ssbo_index] =
+                !write_extent.bounded ? 1 : (constant ? 2 : 3);
+        } else {
+            graphics_mark_extent[stage][ssbo_index] = 0;
+        }
+        channel_state->graphics_storage_write_marks[stage][ssbo_index] =
+            static_cast<u32>(std::min<u64>(mark, ~u32{0}));
+    }
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
@@ -3150,9 +3198,21 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
 
-        if (is_written) {
+        // EDEN_NX2_GFX_SSBO_NOMARK=1 (experiment): a native program's written binding whose
+        // stores' reach is unknown is not marked GPU-written at all. CPU writes to those pages
+        // then upload over whatever the draw wrote there.
+        static const bool no_mark_unbounded = [] {
+            const char* env = std::getenv("EDEN_NX2_GFX_SSBO_NOMARK");
+            return env != nullptr && env[0] == '1';
+        }();
+        const bool unbounded =
+            ((channel_state->unbounded_graphics_storage_writes[stage] >> index) & 1) != 0;
+        const u32 mark =
+            std::min(size, channel_state->graphics_storage_write_marks[stage][index]);
+        if (is_written && mark != 0 && !(no_mark_unbounded && unbounded)) {
             trap_source.kind = 1;
-            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
+            trap_source.extent = graphics_mark_extent[stage][index];
+            MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark);
         }
 
         if constexpr (NEEDS_BIND_STORAGE_INDEX) {

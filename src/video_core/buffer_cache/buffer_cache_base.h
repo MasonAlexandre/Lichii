@@ -161,6 +161,11 @@ public:
 
     std::array<u64, NUM_STAGES> enabled_storage_buffers{};
     std::array<u64, NUM_STAGES> written_storage_buffers{};
+    // Bytes from each graphics storage binding's start that a draw marks GPU-written: the reach
+    // of a native program's stores when they are all at constant offsets past the pointer.
+    std::array<std::array<u32, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_storage_write_marks{};
+    // Written graphics storage bindings of native programs whose stores' reach is unknown.
+    std::array<u64, NUM_STAGES> unbounded_graphics_storage_writes{};
     u64 enabled_compute_storage_buffers = 0;
     u64 written_compute_storage_buffers = 0;
     // Bound by a native (Switch 2) compute program, whose pointers carry no size.
@@ -389,7 +394,8 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written, u32 indirect_offset = ~0U);
+                                   bool is_written, u32 indirect_offset = ~0U,
+                                   const Shader::StorageWriteExtent& write_extent = {});
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -702,6 +708,8 @@ private:
         u8 kind;
         u8 stage;
         u8 index;
+        // Graphics storage: 0 not native, 1 reach unknown, 2 constant reach, 3 reach with strides.
+        u8 extent;
     };
     struct TrapMark {
         DAddr end;
@@ -709,11 +717,13 @@ private:
         TrapSource source;
         u64 traps;
         u64 marks;
+        std::array<u32, 16> histogram;
     };
     static bool TrapStatsEnabled();
     void NoteTrapSource(DAddr device_addr, u64 size, u64 buffer_size);
     void CountTrap(DAddr device_addr);
     TrapSource trap_source{};
+    std::array<std::array<u8, NUM_STORAGE_BUFFERS>, NUM_STAGES> graphics_mark_extent{};
     std::map<DAddr, TrapMark> trap_marks;
     std::array<u64, 12> trap_by_kind{};
     u64 trap_total = 0;

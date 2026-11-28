@@ -751,7 +751,7 @@ void GraphicsPipeline::ConfigureBack(bool is_indexed, BackHalf& half,
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
+                                                       desc.indirect_offset, desc.write_extent);
                 ++ssbo_index;
             }
             const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
@@ -1045,7 +1045,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed, std::optional<PreparedBind
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
+                                                       desc.indirect_offset, desc.write_extent);
                 ++ssbo_index;
             }
         }
@@ -1559,7 +1559,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed, std::optional<PreparedBin
                 ASSERT(desc.count == 1);
                 buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
                                                        desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
+                                                       desc.indirect_offset, desc.write_extent);
                 ++ssbo_index;
             }
         }

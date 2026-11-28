@@ -2124,6 +2124,15 @@ private:
         if (duskbloods_auto_ahead) {
             frames_ahead = 1;
         }
+        // Xenoblade Chronicles DE's render thread waited 8-10 ms a frame here for a GPU that is
+        // behind in its busy areas: a frame ahead, even with the GPU behind, took one spot from
+        // 32 to 53 fps.
+        constexpr u64 XenobladeDeProgramId = 0x0400FF500E34A001ULL;
+        const bool xenoblade_de_ahead =
+            frames_ahead_setting == -1 && app_program_id == XenobladeDeProgramId;
+        if (xenoblade_de_ahead) {
+            frames_ahead = 1;
+        }
         const auto entered = std::chrono::steady_clock::now();
         static const bool fence_trace = [] {
             const char* value = std::getenv("EDEN_NX2_PRESENT_FENCE_TRACE");
@@ -2152,7 +2161,8 @@ private:
                 const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD_STRICT");
                 return value != nullptr && value[0] == '1';
             }();
-            const bool gpu_behind = frames_ahead == 1 && !strict_ahead && m_previous_fence_id < 192 &&
+            const bool gpu_behind = frames_ahead == 1 && !strict_ahead && !xenoblade_de_ahead &&
+                                    m_previous_fence_id < 192 &&
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);

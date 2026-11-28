@@ -2145,7 +2145,14 @@ private:
             // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
             // suspended channel brought us here: this frame can't finish before the present
             // returns.
-            const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
+            // EDEN_NX2_FRAMES_AHEAD_STRICT=1 keeps running a frame ahead with the GPU behind too:
+            // the render thread of a GPU-bound game then overlaps the GPU instead of waiting for
+            // both frames (Xenoblade DE: 8-10 ms a frame). Opt-in: Splatoon Raiders breaks.
+            static const bool strict_ahead = [] {
+                const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD_STRICT");
+                return value != nullptr && value[0] == '1';
+            }();
+            const bool gpu_behind = frames_ahead == 1 && !strict_ahead && m_previous_fence_id < 192 &&
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);

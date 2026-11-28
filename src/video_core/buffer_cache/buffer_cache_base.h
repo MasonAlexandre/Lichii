@@ -11,6 +11,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <map>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -694,6 +695,31 @@ private:
     void UpdateComputeTextureBuffers();
 
     void MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync = false);
+
+    // EDEN_NX2_TRAP_SOURCES / EDEN_NX2_GUEST_THREAD_STATS: which GPU writes leave the pages the
+    // CPU then writes GPU-modified (each such CPU write traps and is collected).
+    struct TrapSource {
+        u8 kind;
+        u8 stage;
+        u8 index;
+    };
+    struct TrapMark {
+        DAddr end;
+        u64 buffer_size;
+        TrapSource source;
+        u64 traps;
+        u64 marks;
+    };
+    static bool TrapStatsEnabled();
+    void NoteTrapSource(DAddr device_addr, u64 size, u64 buffer_size);
+    void CountTrap(DAddr device_addr);
+    TrapSource trap_source{};
+    std::map<DAddr, TrapMark> trap_marks;
+    std::array<u64, 12> trap_by_kind{};
+    u64 trap_total = 0;
+    u64 trap_unknown = 0;
+    u64 trap_marks_dropped_traps = 0;
+    std::chrono::steady_clock::time_point trap_window_start{};
 
     /// Counts a GPU write to the command list pages in the range (invalidating their copies) and,
     /// while collecting, asks for new copies.

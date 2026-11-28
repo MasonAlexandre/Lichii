@@ -365,10 +365,113 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        if (TrapStatsEnabled()) {
+            CountTrap(device_addr);
+        }
         return true;
     }
     WriteMemory(device_addr, size);
     return false;
+}
+
+template <class P>
+bool BufferCache<P>::TrapStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_GUEST_THREAD_STATS") != nullptr ||
+                                std::getenv("EDEN_NX2_TRAP_SOURCES") != nullptr;
+    return enabled;
+}
+
+template <class P>
+void BufferCache<P>::NoteTrapSource(DAddr device_addr, u64 size, u64 buffer_size) {
+    if (!TrapStatsEnabled() || size == 0) {
+        return;
+    }
+    // Keep the newest mark per start address; drop the marks that the new one covers whole.
+    auto it = trap_marks.lower_bound(device_addr);
+    while (it != trap_marks.end() && it->first < device_addr + size &&
+           it->second.end <= device_addr + size) {
+        if (it->first != device_addr) {
+            trap_marks_dropped_traps += it->second.traps;
+            it = trap_marks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    auto& rec = trap_marks[device_addr];
+    rec.end = device_addr + size;
+    rec.buffer_size = buffer_size;
+    rec.source = trap_source;
+    ++rec.marks;
+    if (trap_marks.size() > 65536) {
+        trap_marks.clear();
+    }
+}
+
+template <class P>
+void BufferCache<P>::CountTrap(DAddr device_addr) {
+    ++trap_total;
+    auto it = trap_marks.upper_bound(device_addr);
+    bool found = false;
+    // A few marks back: an older, larger mark can start before a newer, smaller one.
+    for (int step = 0; step < 8 && it != trap_marks.begin(); ++step) {
+        --it;
+        if (it->second.end > device_addr) {
+            ++it->second.traps;
+            ++trap_by_kind[it->second.source.kind < trap_by_kind.size() ? it->second.source.kind
+                                                                          : 0];
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ++trap_unknown;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (trap_window_start == std::chrono::steady_clock::time_point{}) {
+        trap_window_start = now;
+        return;
+    }
+    if (now - trap_window_start < std::chrono::seconds{10}) {
+        return;
+    }
+    static constexpr std::array<const char*, 12> names{
+        "unknown",          "gfx SSBO",          "gfx SSBO multi-range",
+        "compute native full (no extent)", "compute native narrowed",
+        "compute non-native", "compute multi-range", "gfx texel buffer",
+        "transform feedback", "compute texel buffer", "ObtainBuffer write", "DMA copy"};
+    std::string kinds;
+    for (size_t k = 0; k < trap_by_kind.size(); ++k) {
+        if (trap_by_kind[k] != 0) {
+            kinds += fmt::format("{}: {}; ", names[k], trap_by_kind[k]);
+        }
+    }
+    std::vector<std::pair<DAddr, const TrapMark*>> top;
+    for (const auto& [addr, rec] : trap_marks) {
+        if (rec.traps != 0) {
+            top.emplace_back(addr, &rec);
+        }
+    }
+    std::ranges::sort(top, [](const auto& a, const auto& b) {
+        return a.second->traps > b.second->traps;
+    });
+    std::string tops;
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+        const auto& [addr, rec] = top[i];
+        tops += fmt::format("\n  {:#x}+{:#x} (buffer {:#x}) {} stage {} index {}: {} traps, {} marks",
+                            addr, rec->end - addr, rec->buffer_size, names[rec->source.kind],
+                            rec->source.stage, rec->source.index, rec->traps, rec->marks);
+    }
+    LOG_INFO(HW_GPU,
+             "Trapped CPU writes to GPU-written buffer pages over 10 s: {} new-page traps, {} with "
+             "no mark found, {} on dropped marks; by source: {}top marks:{}",
+             trap_total, trap_unknown, trap_marks_dropped_traps, kinds, tops);
+    trap_total = trap_unknown = trap_marks_dropped_traps = 0;
+    trap_by_kind.fill(0);
+    for (auto& [addr, rec] : trap_marks) {
+        rec.traps = 0;
+        rec.marks = 0;
+    }
+    trap_window_start = now;
 }
 
 template <class P>
@@ -1651,6 +1754,8 @@ bool BufferCache<P>::DMACopy(
         *gpu_written_dest = tmp_intervals;
     }
     if (has_new_downloads) {
+        trap_source = {11, 0, 0};
+        NoteTrapSource(*cpu_dest_address, amount, amount);
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -1723,6 +1828,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 
     switch (post_op) {
     case ObtainBufferOperation::MarkAsWritten:
+        trap_source = {10, 0, 0};
         MarkWrittenBuffer(buffer_id, device_addr, size);
         buffer.MarkUsage(buffer.Offset(device_addr), size);
         break;
@@ -3032,6 +3138,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+        trap_source = {2, static_cast<u8>(stage), static_cast<u8>(index)};
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             return;
         }
@@ -3044,6 +3151,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         buffer.MarkUsage(offset, size);
 
         if (is_written) {
+            trap_source.kind = 1;
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 
@@ -3066,6 +3174,7 @@ void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
 
         const bool is_written = ((channel_state->written_texture_buffers[stage] >> index) & 1) != 0;
         if (is_written) {
+            trap_source = {7, static_cast<u8>(stage), static_cast<u8>(index)};
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 
@@ -3104,6 +3213,7 @@ void BufferCache<P>::BindHostTransformFeedbackBuffers() {
             TouchBuffer(buffer, binding.buffer_id);
             size = binding.size;
             SynchronizeBuffer(buffer, binding.device_addr, size);
+            trap_source = {8, 0, 0};
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
             offset = buffer.Offset(binding.device_addr);
             buffer.MarkUsage(offset, size);
@@ -3192,6 +3302,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
             ((channel_state->native_compute_storage_buffers >> index) & 1) != 0;
         const u64 write_mark_limit =
             native ? u64{channel_state->compute_storage_write_marks[index]} : ~u64{0};
+        trap_source = {6, 5, static_cast<u8>(index)};
         if (BindMultiRangeStorage(binding, is_written, compute_segments, write_mark_limit)) {
             return;
         }
@@ -3206,6 +3317,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const u32 mark =
             is_written ? static_cast<u32>(std::min<u64>(size, write_mark_limit)) : 0;
         if (mark != 0) {
+            trap_source.kind = !native ? 5 : (mark >= size ? 3 : 4);
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, mark, true);
         }
 
@@ -3229,6 +3341,7 @@ void BufferCache<P>::BindHostComputeTextureBuffers() {
         const bool is_written =
             ((channel_state->written_compute_texture_buffers >> index) & 1) != 0;
         if (is_written) {
+            trap_source = {9, 5, static_cast<u8>(index)};
             MarkWrittenBuffer(binding.buffer_id, binding.device_addr, size);
         }
 
@@ -3534,6 +3647,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     OutdateReadDownloads(device_addr, size);
     NoteReadBackWrite(device_addr, size);
+    NoteTrapSource(device_addr, size, slot_buffers[buffer_id].SizeBytes());
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     NoteUniformWrite(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
